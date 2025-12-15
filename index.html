@@ -3,293 +3,499 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Three.js 粒子圣诞树 - 手势聚合/离散</title>
+    <title>Gesture Controlled Christmas Tree</title>
     <style>
-        body { margin: 0; overflow: hidden; background-color: #000; }
-        #canvas-container { width: 100%; height: 100vh; }
-        .input_video { display: none; }
-        #loading {
-            position: absolute; top: 50%; left: 50%; 
-            transform: translate(-50%, -50%); color: white; font-family: sans-serif; pointer-events: none;
+        body { margin: 0; overflow: hidden; background-color: #050a05; font-family: 'Segoe UI', sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        
+        /* 摄像头画面隐藏，我们只需要数据 */
+        #video-input { display: none; }
+        
+        /* UI 覆盖层 */
+        #ui-layer {
+            position: absolute;
+            z-index: 10;
+            bottom: 30px;
+            right: 30px;
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            pointer-events: none; /* 让鼠标穿透，不影响交互 */
         }
-        #status {
-            position: absolute; top: 10px; left: 10px;
-            color: #0f0; font-family: monospace; font-size: 16px; pointer-events: none;
+
+        .upload-btn {
+            pointer-events: auto;
+            background: linear-gradient(135deg, #d4af37 0%, #b8860b 100%);
+            border: 1px solid #ffd700;
+            color: #2f0a0a;
+            padding: 12px 24px;
+            border-radius: 30px;
+            font-weight: bold;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            cursor: pointer;
+            box-shadow: 0 0 15px rgba(212, 175, 55, 0.4);
+            transition: all 0.3s ease;
+            font-size: 14px;
+        }
+
+        .upload-btn:hover {
+            box-shadow: 0 0 25px rgba(212, 175, 55, 0.8);
+            transform: scale(1.05);
+        }
+
+        #status-text {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: rgba(212, 175, 55, 0.7);
+            font-size: 14px;
+            z-index: 10;
+            background: rgba(0,0,0,0.3);
+            padding: 8px 15px;
+            border-radius: 4px;
+            border-left: 2px solid #d4af37;
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            color: #d4af37;
+            font-size: 24px;
+            z-index: 20;
+            text-shadow: 0 0 10px #d4af37;
         }
     </style>
+    <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/+esm"
+            }
+        }
+    </script>
 </head>
 <body>
-    <div id="loading">正在加载摄像头和模型...</div>
-    <div id="status">等待手势识别...</div>
+
+    <div id="loading">正在加载视觉模型与3D引擎...</div>
+    <div id="status-text">等待摄像头...</div>
     <div id="canvas-container"></div>
-    <video class="input_video"></video>
+    <video id="video-input" autoplay playsinline></video>
 
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <div id="ui-layer">
+        <label class="upload-btn">
+            上传照片挂饰
+            <input type="file" id="image-upload" accept="image/*" multiple style="display: none;">
+        </label>
+    </div>
 
-    <script type="x-shader/x-vertex" id="vertexshader">
-        uniform float uTime;
-        // 新的 uniform: 0.0 = 聚合成树, 1.0 = 完全扩散
-        uniform float uDispersalState; 
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
 
-        attribute float size;
-        attribute vec3 customColor;
-        attribute vec3 basePosition; 
-        // 每个粒子预先计算好的随机扩散方向
-        attribute vec3 explosionDirection;
+        // --- 配置参数 ---
+        const CONFIG = {
+            colors: {
+                green: 0x133613, // 哑光绿
+                gold: 0xFFD700,  // 金属金
+                red: 0x8B0000,   // 圣诞红
+                white: 0xEEEEEE
+            },
+            particleCount: 250,
+            treeHeight: 25,
+            treeRadius: 10,
+            scatterRadius: 40
+        };
 
-        varying vec3 vColor;
-
-        void main() {
-            vColor = customColor;
-
-            // 1. 计算爆炸后的目标位置
-            // 沿预定方向向外移动一定距离 (例如 25.0)
-            vec3 dispersedPosition = basePosition + explosionDirection * 25.0;
-
-            // 2. 核心交互：在原始位置和离散位置之间进行线性插值 (mix)
-            vec3 newPosition = mix(basePosition, dispersedPosition, uDispersalState);
-
-            // 3. 添加一点基础的自然摆动，让画面更生动
-            newPosition.x += sin(uTime * 1.5 + basePosition.y * 0.3) * 0.08 * (1.0 - uDispersalState * 0.5);
-            newPosition.z += cos(uTime * 1.5 + basePosition.y * 0.3) * 0.08 * (1.0 - uDispersalState * 0.5);
-            // 当扩散时，增加一点随机的上下浮动
-            newPosition.y += sin(uTime * 2.0 + basePosition.x) * 0.5 * uDispersalState;
-
-            vec4 mvPosition = modelViewMatrix * vec4(newPosition, 1.0);
-            
-            // 扩散时稍微增大粒子尺寸，增强视觉效果
-            float currentSize = size * (1.0 + uDispersalState * 0.5);
-            gl_PointSize = currentSize * (300.0 / -mvPosition.z);
-            gl_Position = projectionMatrix * mvPosition;
-        }
-    </script>
-
-    <script type="x-shader/x-fragment" id="fragmentshader">
-        uniform sampler2D pointTexture;
-        varying vec3 vColor;
-        void main() {
-            vec2 cxy = 2.0 * gl_PointCoord - 1.0;
-            float r = dot(cxy, cxy);
-            if (r > 1.0) discard;
-            float intensity = 1.0 - r; 
-            gl_FragColor = vec4(vColor * intensity, 1.0); 
-        }
-    </script>
-
-    <script>
-        let scene, camera, renderer, particleSystem, uniforms;
-        // 目标离散状态 (由手势决定)
-        let targetDispersalState = 0.0; 
-        // 当前实际渲染的离散状态 (用于平滑过渡)
-        let currentDispersalState = 0.0; 
-
-        const container = document.getElementById('canvas-container');
-        const loadingElement = document.getElementById('loading');
-        const statusElement = document.getElementById('status');
-
-        initThree();
-        initMediaPipe();
-        animate();
-
+        // --- 全局变量 ---
+        let scene, camera, renderer, composer;
+        let particles = []; // 存储所有3D对象的数据结构
+        let uploadedTextures = [];
+        let photoParticlesIndices = []; // 存储是照片类型的粒子的索引
+        let rootGroup; // 旋转容器
+        
+        // 状态管理
+        const STATE = {
+            TREE: 'tree',
+            SCATTER: 'scatter',
+            ZOOM: 'zoom'
+        };
+        let currentState = STATE.TREE;
+        let targetState = STATE.TREE;
+        let zoomTargetIndex = -1; // 当前放大的照片索引
+        
+        // 手势相关
+        let handLandmarker = undefined;
+        let lastVideoTime = -1;
+        const video = document.getElementById('video-input');
+        
+        // --- 1. 初始化 Three.js 场景 ---
         function initThree() {
+            const container = document.getElementById('canvas-container');
+
             scene = new THREE.Scene();
-            scene.fog = new THREE.FogExp2(0x000000, 0.01);
+            scene.fog = new THREE.FogExp2(0x050a05, 0.02);
 
-            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-            // 稍微拉远一点相机，以便看到扩散效果
-            camera.position.set(0, 6, 18);
-            camera.lookAt(0, 4, 0);
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 0, 40);
 
-            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true });
             renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.toneMapping = THREE.ReinhardToneMapping;
             container.appendChild(renderer.domElement);
 
-            // --- 创建粒子 ---
-            const particleCount = 18000; 
-            const geometry = new THREE.BufferGeometry();
+            // 灯光系统 - 营造金碧辉煌
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.2);
+            scene.add(ambientLight);
+
+            const pointLight = new THREE.PointLight(CONFIG.colors.gold, 2, 100);
+            pointLight.position.set(0, 10, 10);
+            scene.add(pointLight);
             
-            const basePositions = [];
-            const colors = [];
-            const sizes = [];
-            const explosionDirections = []; // 新增：存储每个粒子的爆炸方向
+            const redLight = new THREE.PointLight(CONFIG.colors.red, 1, 100);
+            redLight.position.set(-10, -10, 10);
+            scene.add(redLight);
 
-            const colorGreen = new THREE.Color(0x2f6f2f);
-            const colorLightGreen = new THREE.Color(0x4f8f4f);
-            const colorRed = new THREE.Color(0xff0000);
-            const colorGold = new THREE.Color(0xffd700);
-            const colorBlue = new THREE.Color(0x0088ff); // 新增一种装饰色
+            // 后处理 - 辉光效果
+            const renderScene = new RenderPass(scene, camera);
+            const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+            bloomPass.threshold = 0.2; // 阈值
+            bloomPass.strength = 1.2;  // 强度
+            bloomPass.radius = 0.5;    // 半径
 
-            for (let i = 0; i < particleCount; i++) {
-                // 圣诞树形态生成
-                const height = Math.random() * 12;
-                const level = height / 12; 
-                // 使用指数函数让树顶部更尖，底部更宽
-                const radius = Math.pow((1.0 - level), 1.5) * 5.5; 
-                const angle = i * 0.1 + level * 25.0;
+            composer = new EffectComposer(renderer);
+            composer.addPass(renderScene);
+            composer.addPass(bloomPass);
 
-                const x = Math.cos(angle) * radius + (Math.random() - 0.5) * 0.6;
-                const y = height;
-                const z = Math.sin(angle) * radius + (Math.random() - 0.5) * 0.6;
+            // 创建粒子组容器
+            rootGroup = new THREE.Group();
+            scene.add(rootGroup);
 
-                basePositions.push(x, y, z);
+            // 生成圣诞树粒子
+            generateParticles();
 
-                // --- 计算爆炸方向 ---
-                // 基础方向是远离 Y 轴中心
-                let dir = new THREE.Vector3(x, y, z).sub(new THREE.Vector3(0, y, 0)).normalize();
-                // 加上强烈的随机噪声，使爆炸看起来混乱、有力
-                dir.x += (Math.random() - 0.5) * 2.0;
-                dir.y += (Math.random() - 0.5) * 2.0; // 允许向上或向下炸
-                dir.z += (Math.random() - 0.5) * 2.0;
-                dir.normalize();
-                explosionDirections.push(dir.x, dir.y, dir.z);
+            // 监听窗口大小
+            window.addEventListener('resize', onWindowResize);
+            
+            // 监听图片上传
+            document.getElementById('image-upload').addEventListener('change', handleImageUpload);
+        }
 
-                // 颜色和大小逻辑 (增加了一些蓝色装饰)
-                let color, size;
-                const ornamentRoll = Math.random();
-                if (ornamentRoll > 0.96) { color = colorRed; size = Math.random() * 0.7 + 0.5; }
-                else if (ornamentRoll > 0.92) { color = colorGold; size = Math.random() * 0.7 + 0.5; }
-                else if (ornamentRoll > 0.89) { color = colorBlue; size = Math.random() * 0.6 + 0.4; }
-                else {
-                    color = Math.random() > 0.5 ? colorGreen : colorLightGreen;
-                    size = Math.random() * 0.25 + 0.1;
+        // --- 2. 粒子生成逻辑 ---
+        function generateParticles() {
+            const geometrySphere = new THREE.SphereGeometry(0.4, 16, 16);
+            const geometryCube = new THREE.BoxGeometry(0.6, 0.6, 0.6);
+            const geometryPlane = new THREE.PlaneGeometry(1.5, 2); // 照片
+
+            // 材质
+            const matGold = new THREE.MeshStandardMaterial({ 
+                color: CONFIG.colors.gold, metalness: 1.0, roughness: 0.2, emissive: 0x332200 
+            });
+            const matGreen = new THREE.MeshStandardMaterial({ 
+                color: CONFIG.colors.green, metalness: 0.1, roughness: 0.9 
+            });
+            const matRed = new THREE.MeshStandardMaterial({ 
+                color: CONFIG.colors.red, metalness: 0.6, roughness: 0.4, emissive: 0x220000 
+            });
+            const matPhotoBase = new THREE.MeshBasicMaterial({ 
+                color: 0x333333, side: THREE.DoubleSide 
+            }); // 默认照片底色
+
+            for (let i = 0; i < CONFIG.particleCount; i++) {
+                // 螺旋算法生成树形坐标
+                const t = i / CONFIG.particleCount;
+                const angle = t * 30; // 螺旋圈数
+                const y = (1 - t) * CONFIG.treeHeight - CONFIG.treeHeight / 2;
+                const radius = t * CONFIG.treeRadius;
+                
+                const x = Math.cos(angle) * radius;
+                const z = Math.sin(angle) * radius;
+
+                // 随机决定粒子类型
+                let mesh;
+                let type = 'decoration';
+                let rand = Math.random();
+
+                if (i % 15 === 0) {
+                    // 照片节点
+                    mesh = new THREE.Mesh(geometryPlane, matPhotoBase.clone());
+                    type = 'photo';
+                    photoParticlesIndices.push(particles.length);
+                } else if (rand > 0.6) {
+                    mesh = new THREE.Mesh(geometrySphere, matGold);
+                } else if (rand > 0.3) {
+                    mesh = new THREE.Mesh(geometryCube, matRed);
+                } else {
+                    mesh = new THREE.Mesh(geometryCube, matGreen);
                 }
-                colors.push(color.r, color.g, color.b);
-                sizes.push(size);
+
+                // 初始位置（随机散开用于入场效果）
+                mesh.position.set(
+                    (Math.random() - 0.5) * 100,
+                    (Math.random() - 0.5) * 100,
+                    (Math.random() - 0.5) * 100
+                );
+                
+                mesh.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, 0);
+
+                rootGroup.add(mesh);
+
+                // 存储粒子数据
+                particles.push({
+                    mesh: mesh,
+                    type: type,
+                    treePos: new THREE.Vector3(x, y, z),
+                    treeRot: new THREE.Euler(0, -angle, 0), // 面向外
+                    scatterPos: new THREE.Vector3(
+                        (Math.random() - 0.5) * CONFIG.scatterRadius,
+                        (Math.random() - 0.5) * CONFIG.scatterRadius,
+                        (Math.random() - 0.5) * CONFIG.scatterRadius
+                    ),
+                    scatterRot: new THREE.Euler(Math.random()*Math.PI, Math.random()*Math.PI, 0),
+                    velocity: new THREE.Vector3(0,0,0) // 用于漂浮动画
+                });
             }
+        }
 
-            geometry.setAttribute('position', new THREE.Float32BufferAttribute(basePositions, 3));
-            geometry.setAttribute('basePosition', new THREE.Float32BufferAttribute(basePositions, 3));
-            geometry.setAttribute('explosionDirection', new THREE.Float32BufferAttribute(explosionDirections, 3));
-            geometry.setAttribute('customColor', new THREE.Float32BufferAttribute(colors, 3));
-            geometry.setAttribute('size', new THREE.Float32BufferAttribute(sizes, 1));
+        // --- 3. 视觉模型 (MediaPipe) ---
+        async function setupMediaPipe() {
+            const vision = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+            );
+            
+            handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numHands: 1
+            });
 
-            // --- Uniforms 定义 ---
-            uniforms = {
-                uTime: { value: 0.0 },
-                uDispersalState: { value: 0.0 } // 初始状态为聚合
+            // 启动摄像头
+            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                navigator.mediaDevices.getUserMedia({ video: true }).then((stream) => {
+                    video.srcObject = stream;
+                    video.addEventListener("loadeddata", predictWebcam);
+                    document.getElementById('loading').style.display = 'none';
+                    document.getElementById('status-text').innerText = "系统就绪：请展示手势";
+                });
+            }
+        }
+
+        // --- 4. 预测与交互逻辑 ---
+        async function predictWebcam() {
+            let nowInMs = Date.now();
+            if (video.currentTime !== lastVideoTime) {
+                lastVideoTime = video.currentTime;
+                const results = handLandmarker.detectForVideo(video, nowInMs);
+
+                if (results.landmarks && results.landmarks.length > 0) {
+                    processGestures(results.landmarks[0]);
+                } else {
+                    // 没有检测到手，缓慢恢复默认视角
+                    targetState = currentState; 
+                }
+            }
+            window.requestAnimationFrame(predictWebcam);
+        }
+
+        function processGestures(landmarks) {
+            // landmarks: 0=wrist, 4=thumb_tip, 8=index_tip, 12=middle_tip, etc.
+            
+            const thumbTip = landmarks[4];
+            const indexTip = landmarks[8];
+            const middleTip = landmarks[12];
+            const ringTip = landmarks[16];
+            const pinkyTip = landmarks[20];
+            const wrist = landmarks[0];
+
+            // 计算手指是否伸展（简单算法：指尖到手腕的距离）
+            // 归一化坐标，距离需要结合 aspect ratio，这里简化处理
+            const isFingerOpen = (tip, base) => {
+                return Math.sqrt(Math.pow(tip.x - base.x, 2) + Math.pow(tip.y - base.y, 2)) > 0.1; // 阈值
             };
 
-            const shaderMaterial = new THREE.ShaderMaterial({
-                uniforms: uniforms,
-                vertexShader: document.getElementById('vertexshader').textContent,
-                fragmentShader: document.getElementById('fragmentshader').textContent,
-                blending: THREE.AdditiveBlending,
-                depthTest: false,
-                transparent: true,
-                vertexColors: true
-            });
+            const fingersOpenCount = [
+                isFingerOpen(indexTip, wrist),
+                isFingerOpen(middleTip, wrist),
+                isFingerOpen(ringTip, wrist),
+                isFingerOpen(pinkyTip, wrist)
+            ].filter(Boolean).length;
 
-            particleSystem = new THREE.Points(geometry, shaderMaterial);
-            scene.add(particleSystem);
-
-            // 地面
-            const ground = new THREE.Mesh(
-                new THREE.PlaneGeometry(50, 50),
-                new THREE.MeshBasicMaterial({ color: 0x0a2a0a, transparent: true, opacity: 0.15, side: THREE.DoubleSide })
+            // 计算捏合 (Thumb + Index)
+            const pinchDist = Math.sqrt(
+                Math.pow(thumbTip.x - indexTip.x, 2) + 
+                Math.pow(thumbTip.y - indexTip.y, 2)
             );
-            ground.rotation.x = Math.PI / 2;
-            ground.position.y = -0.5;
-            scene.add(ground);
 
-            window.addEventListener('resize', () => {
-                camera.aspect = window.innerWidth / window.innerHeight;
-                camera.updateProjectionMatrix();
-                renderer.setSize(window.innerWidth, window.innerHeight);
-            });
-        }
+            const statusDiv = document.getElementById('status-text');
 
-        // --- MediaPipe Hands 集成与手势分析 ---
-        function initMediaPipe() {
-            const videoElement = document.getElementsByClassName('input_video')[0];
-            const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+            // --- 状态机逻辑 ---
             
-            hands.setOptions({
-                maxNumHands: 1,
-                modelComplexity: 0, // 用最简模型提高速度
-                minDetectionConfidence: 0.5,
-                minTrackingConfidence: 0.5
-            });
-
-            hands.onResults(onHandsResults);
-
-            const cameraUtils = new Camera(videoElement, {
-                onFrame: async () => { await hands.send({image: videoElement}); },
-                width: 640, height: 480
-            });
-            cameraUtils.start().then(() => {
-                loadingElement.style.display = 'none';
-                console.log("摄像头已启动");
-            }).catch(err => {
-                loadingElement.textContent = "无法访问摄像头";
-            });
-        }
-
-        function onHandsResults(results) {
-            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
-                const landmarks = results.multiHandLandmarks[0];
+            // 1. 抓取逻辑 (捏合 < 0.05)
+            if (pinchDist < 0.05) {
+                targetState = STATE.ZOOM;
+                statusDiv.innerText = "状态：抓取/放大照片";
                 
-                // --- 手势分析算法：计算张开程度 ---
-                // 计算 5 个指尖 (索引 4, 8, 12, 16, 20) 到手腕 (索引 0) 的平均距离
-                const wrist = landmarks[0];
-                const tipIndices = [4, 8, 12, 16, 20];
-                let totalDistance = 0;
+                // 如果之前不在Zoom状态，寻找最近的照片
+                if (currentState !== STATE.ZOOM) {
+                    findClosestPhoto();
+                }
+            }
+            // 2. 握拳 (伸展手指 <= 1)
+            else if (fingersOpenCount <= 1) {
+                targetState = STATE.TREE;
+                statusDiv.innerText = "状态：圣诞树合拢";
+                zoomTargetIndex = -1;
+            }
+            // 3. 张开手 (伸展手指 >= 3)
+            else if (fingersOpenCount >= 3) {
+                targetState = STATE.SCATTER;
+                statusDiv.innerText = "状态：散开漫游";
+                zoomTargetIndex = -1;
+
+                // 在散开模式下，根据手的位置旋转场景 (视差)
+                // Hand x: 0(left) -> 1(right). Map to rotation.
+                // 翻转X轴因为自拍镜像
+                const rotX = (landmarks[9].y - 0.5) * 2; // Up/Down
+                const rotY = (landmarks[9].x - 0.5) * 2; // Left/Right
                 
-                tipIndices.forEach(idx => {
-                    const tip = landmarks[idx];
-                    // 计算简单的 2D 欧几里得距离 (使用归一化坐标足够了)
-                    const dx = tip.x - wrist.x;
-                    const dy = tip.y - wrist.y;
-                    totalDistance += Math.sqrt(dx*dx + dy*dy);
-                });
-
-                const avgDistance = totalDistance / 5;
-
-                // --- 阈值映射 ---
-                // 根据经验，握拳时平均距离通常小于 0.2，张开时大于 0.35 (归一化坐标下)
-                // 这些值可能需要根据具体摄像头情况微调
-                const closedThreshold = 0.18;
-                const openThreshold = 0.38;
-
-                // 将平均距离映射到 0.0 (握拳/聚合) 到 1.0 (张开/扩散) 的范围
-                let openness = (avgDistance - closedThreshold) / (openThreshold - closedThreshold);
-                // 钳制结果在 0 到 1 之间
-                targetDispersalState = Math.max(0.0, Math.min(1.0, openness));
-
-                statusElement.textContent = `手势识别中: ${targetDispersalState > 0.5 ? "张开 (扩散)" : "握拳 (聚合)"} (强度: ${targetDispersalState.toFixed(2)})`;
-                statusElement.style.color = targetDispersalState > 0.5 ? "#ff3333" : "#33ff33";
-
-            } else {
-                // 如果没有检测到手，默认缓慢回到聚合状态
-                targetDispersalState = 0.0;
-                statusElement.textContent = "未检测到手部";
-                statusElement.style.color = "#ccc";
+                // 平滑旋转
+                rootGroup.rotation.x += (rotX * 0.5 - rootGroup.rotation.x) * 0.05;
+                rootGroup.rotation.y += (rotY * 0.5 - rootGroup.rotation.y) * 0.05;
             }
         }
 
+        function findClosestPhoto() {
+            // 简单逻辑：随机选一张或者按顺序轮询，
+            // 理想逻辑是Raycaster，但这里没有鼠标，我们随机选一张未展示的
+            if (photoParticlesIndices.length > 0) {
+                 // 简单取余数循环，或者随机
+                 const r = Math.floor(Math.random() * photoParticlesIndices.length);
+                 zoomTargetIndex = photoParticlesIndices[r];
+            }
+        }
+
+        // --- 5. 动画循环 ---
         function animate() {
             requestAnimationFrame(animate);
-            
-            uniforms.uTime.value += 0.01;
-            
-            // --- 核心：平滑过渡状态 ---
-            // 使用线性插值 (lerp) 让当前状态缓慢接近目标状态
-            // 0.05 是平滑系数，值越小过渡越慢
-            currentDispersalState += (targetDispersalState - currentDispersalState) * 0.05;
 
-            // 更新 uniform 传给着色器
-            uniforms.uDispersalState.value = currentDispersalState;
+            const time = Date.now() * 0.001;
+            currentState = targetState;
 
-            // 旋转整个系统，在扩散时加快旋转速度增强动感
-            if (particleSystem) {
-                particleSystem.rotation.y += 0.002 + currentDispersalState * 0.005;
+            particles.forEach((p, index) => {
+                let targetPos, targetRot;
+
+                // 计算目标位置
+                if (currentState === STATE.TREE) {
+                    targetPos = p.treePos;
+                    targetRot = p.treeRot;
+                    // 树状态下的微动：自转
+                    p.mesh.rotation.y += 0.01; 
+                } else if (currentState === STATE.SCATTER) {
+                    // 加上漂浮噪点
+                    const noiseX = Math.sin(time + index) * 2;
+                    const noiseY = Math.cos(time * 0.8 + index) * 2;
+                    
+                    targetPos = p.scatterPos.clone().add(new THREE.Vector3(noiseX, noiseY, 0));
+                    targetRot = p.scatterRot;
+                    p.mesh.rotation.x += 0.005;
+                    p.mesh.rotation.y += 0.005;
+                } else if (currentState === STATE.ZOOM) {
+                    if (index === zoomTargetIndex) {
+                        // 特选照片飞到相机前
+                        // 相机在 (0,0,40)，我们放到 (0,0,35)
+                        targetPos = new THREE.Vector3(0, 0, 35);
+                        // 修正旋转使其正对相机
+                        targetRot = new THREE.Euler(0, 0, 0);
+                        
+                        // 稍微放大
+                        const scale = 3;
+                        p.mesh.scale.lerp(new THREE.Vector3(scale, scale, scale), 0.1);
+                    } else {
+                        // 其他粒子散开并变暗/推远
+                        targetPos = p.scatterPos.clone().multiplyScalar(1.5); // 炸得更开
+                        targetRot = p.scatterRot;
+                        p.mesh.scale.lerp(new THREE.Vector3(1, 1, 1), 0.1);
+                    }
+                }
+
+                // Lerp 插值动画 (平滑过渡核心)
+                if (targetPos) {
+                    p.mesh.position.lerp(targetPos, 0.05);
+                }
+                
+                // Quaternion slerp preferred usually, but Euler lerp is okay for simple effects
+                // 这里简单处理旋转，如果是 ZOOM 状态需要强行设正
+                if (currentState === STATE.ZOOM && index === zoomTargetIndex) {
+                     p.mesh.rotation.x += (0 - p.mesh.rotation.x) * 0.1;
+                     p.mesh.rotation.y += (0 - p.mesh.rotation.y) * 0.1;
+                     p.mesh.rotation.z += (0 - p.mesh.rotation.z) * 0.1;
+                }
+            });
+
+            // 树状态整体自转
+            if (currentState === STATE.TREE) {
+                rootGroup.rotation.y += 0.002;
+                // 归位X轴
+                rootGroup.rotation.x += (0 - rootGroup.rotation.x) * 0.05;
             }
 
-            renderer.render(scene, camera);
+            composer.render();
         }
+
+        // --- 辅助功能 ---
+        function handleImageUpload(event) {
+            const files = event.target.files;
+            if (!files.length) return;
+
+            const loader = new THREE.TextureLoader();
+
+            Array.from(files).forEach((file, i) => {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    loader.load(e.target.result, (texture) => {
+                        // 找到一个照片粒子并替换材质
+                        // 为了演示，简单的循环分配
+                        const targetIndex = photoParticlesIndices[uploadedTextures.length % photoParticlesIndices.length];
+                        const p = particles[targetIndex];
+                        
+                        if (p) {
+                            p.mesh.material = new THREE.MeshBasicMaterial({
+                                map: texture,
+                                side: THREE.DoubleSide
+                            });
+                            // 修正比例
+                            const aspect = texture.image.width / texture.image.height;
+                            p.mesh.geometry = new THREE.PlaneGeometry(2 * aspect, 2);
+                        }
+                        uploadedTextures.push(texture);
+                    });
+                };
+                reader.readAsDataURL(file);
+            });
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // 启动
+        initThree();
+        setupMediaPipe();
+        animate();
+
     </script>
 </body>
 </html>
